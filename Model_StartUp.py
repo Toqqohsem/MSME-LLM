@@ -9,8 +9,23 @@ import re
 import gc
 import json
 import asyncio
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer, BitsAndBytesConfig
+# torch / transformers are imported lazily, inside the functions that need them.
+# The Ollama serving path never touches them, and they are NOT in requirements.txt
+# (only requirements-finetune.txt), so an eager import here makes `import server`
+# fail with ModuleNotFoundError on a standard install. See _try_torch() below.
+
+
+def _try_torch():
+    """Return the torch module, or None if it is not installed.
+
+    Used by the optional local-HuggingFace path. The Ollama path does not need
+    torch, so its absence must never be fatal.
+    """
+    try:
+        import torch
+        return torch
+    except ImportError:
+        return None
 
 try:
     import ollama as _ollama_lib
@@ -110,7 +125,10 @@ def select_model_interactively():
 
 
 def apply_speed_optimizations():
-    """针对 RTX 4080 Laptop GPU 的优化"""
+    """针对本地 HuggingFace 推理路径的优化 (Ollama 路径无需 torch, 直接跳过)"""
+    torch = _try_torch()
+    if torch is None:
+        return
     if torch.cuda.is_available():
         # TF32 加速矩阵运算 (Ampere/Ada GPU)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -152,7 +170,15 @@ def load_model_and_tokenizer(model_path, model_type="hf"):
         print(f"  ✅ Ollama 就绪! 模型: {ollama_name} (RTX 4080 全速 GPU 加速)")
         return ollama_name, "ollama"
 
-    # 以下是原生的 HuggingFace 加载逻辑
+    # 以下是原生的 HuggingFace 加载逻辑 (需要 torch / transformers)
+    torch = _try_torch()
+    if torch is None:
+        print("  ❌ 本地 HuggingFace 推理需要 torch / transformers, 但未安装。")
+        print("     请运行: pip install -r requirements-finetune.txt")
+        print("     (若只使用 Ollama 推理, 无需安装。)")
+        sys.exit(1)
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
     if not torch.cuda.is_available():
         print("  ❌ CUDA 不可用!")
         sys.exit(1)
@@ -555,6 +581,13 @@ def generate_response(model, tokenizer, messages, think_mode=True,
 
 
     # ====== 以下是 HuggingFace (Transformers/BitsAndBytes) 的生成逻辑 ======
+    torch = _try_torch()
+    if torch is None:
+        raise RuntimeError(
+            "本地 HuggingFace 生成需要 torch, 但未安装。"
+            "请运行 pip install -r requirements-finetune.txt, 或改用 Ollama 推理 (tokenizer=='ollama')。"
+        )
+
     input_text = build_prompt(tokenizer, messages, think_mode=think_mode)
     inputs = tokenizer(input_text, return_tensors="pt", padding=True)
     input_ids = inputs["input_ids"].to(model.device)
@@ -633,6 +666,7 @@ def single_query_mode(model, tokenizer):
 
 
 def interactive_chat_mode(model, tokenizer, model_name=""):
+    torch = _try_torch()
     print("\n  💬 对话模式 | /help 查看命令 | /quit 退出")
     
     # 联网模块开启查询
@@ -678,7 +712,7 @@ def interactive_chat_mode(model, tokenizer, model_name=""):
                 break
             elif cmd == "/clear":
                 messages = []
-                if torch.cuda.is_available():
+                if torch is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
                 print("  🗑️  对话历史已清空。")
@@ -734,7 +768,7 @@ def interactive_chat_mode(model, tokenizer, model_name=""):
                 print(f"     📝 最大 tokens: {MAX_NEW_TOKENS}")
                 print(f"     ⚡ 量化模式:  {QUANT_MODE}")
                 print(f"     💬 历史:      {len(messages)} 条消息")
-                if torch.cuda.is_available():
+                if torch is not None and torch.cuda.is_available():
                     vram = torch.cuda.memory_allocated(0) / 1024**3
                     print(f"     💾 GPU 显存:  {vram:.1f} GB")
                 continue
